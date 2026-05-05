@@ -168,6 +168,8 @@ func main() {
 		api.Post("/scans", scanHandlers.CreateScan)
 		api.Get("/scans", scanHandlers.ListAllScans)
 		api.Get("/scans/:scanID", scanHandlers.GetScan)
+		api.Get("/scans/:scanID/vulnerabilities", scanHandlers.GetScanVulnerabilities)
+		api.Get("/vulnerabilities", scanHandlers.GetAllVulnerabilities)
 		log.Print("/api routes enabled (DATABASE_URL + SUPABASE_JWT_SECRET)")
 	} else {
 		log.Print("warning: /api routes disabled — set DATABASE_URL and SUPABASE_JWT_SECRET (e.g. in apps/api/.env) to enable scans")

@@ -25,6 +25,7 @@ import (
 	"github.com/sbom-io/api/internal/db"
 	gh "github.com/sbom-io/api/internal/github"
 	"github.com/sbom-io/api/internal/scanner"
+	"github.com/sbom-io/api/internal/vuln"
 )
 
 const localsSupabaseUserID = "supabase_user_id"
@@ -234,16 +235,36 @@ func runScanJob(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, scan
 		}
 	}
 
-	pkgJSON, err := gh.FetchFile(scanCtx, githubToken, owner, repo, "package.json")
-	if err != nil {
-		log.Printf("scan %s: fetch package.json: %v", scanID, err)
-		fail()
-		return
-	}
+	var pkgs []scanner.Package
+	var ecosystem string
+	var err error
 
-	pkgs, err := scanner.ScanNPM(scanCtx, rdb, pkgJSON)
-	if err != nil {
-		log.Printf("scan %s: scan npm: %v", scanID, err)
+	if fileBytes, fetchErr := gh.FetchFile(scanCtx, githubToken, owner, repo, "package.json"); fetchErr == nil {
+		ecosystem = "npm"
+		pkgs, err = scanner.ScanNPM(scanCtx, rdb, fileBytes)
+		if err != nil {
+			log.Printf("scan %s: scan npm: %v", scanID, err)
+			fail()
+			return
+		}
+	} else if fileBytes, fetchErr := gh.FetchFile(scanCtx, githubToken, owner, repo, "requirements.txt"); fetchErr == nil {
+		ecosystem = "pip"
+		pkgs, err = scanner.ScanPip(scanCtx, rdb, fileBytes, "requirements.txt")
+		if err != nil {
+			log.Printf("scan %s: scan pip (requirements.txt): %v", scanID, err)
+			fail()
+			return
+		}
+	} else if fileBytes, fetchErr := gh.FetchFile(scanCtx, githubToken, owner, repo, "pyproject.toml"); fetchErr == nil {
+		ecosystem = "pip"
+		pkgs, err = scanner.ScanPip(scanCtx, rdb, fileBytes, "pyproject.toml")
+		if err != nil {
+			log.Printf("scan %s: scan pip (pyproject.toml): %v", scanID, err)
+			fail()
+			return
+		}
+	} else {
+		log.Printf("scan %s: no supported manifest found in repo", scanID)
 		fail()
 		return
 	}
@@ -254,9 +275,18 @@ func runScanJob(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, scan
 		return
 	}
 
+	vulnerabilities, errVuln := vuln.MatchVulnerabilities(scanCtx, pool, scanID)
+	if errVuln == nil && len(vulnerabilities) > 0 {
+		if err := vuln.SaveComponentVulns(scanCtx, pool, vulnerabilities); err != nil {
+			log.Printf("scan %s: save vulns error: %v", scanID, err)
+		}
+	}
+
 	if err := db.UpdateScanStatus(scanCtx, pool, scanID, "done"); err != nil {
 		log.Printf("scan %s: mark done: %v", scanID, err)
 	}
+
+	log.Printf("Scan done: %d components, %d vulns, ecosystem=%s", len(pkgs), len(vulnerabilities), ecosystem)
 }
 
 // GetScan handles GET /api/scans/:scanID.
@@ -372,4 +402,182 @@ func componentsJSON(components []db.Component) []fiber.Map {
 		})
 	}
 	return out
+}
+
+// GetScanVulnerabilities handles GET /api/scans/:scanID/vulnerabilities
+func (h *Scans) GetScanVulnerabilities(c *fiber.Ctx) error {
+	userID := SupabaseUserID(c)
+	if userID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthenticated"})
+	}
+
+	scanID := strings.TrimSpace(c.Params("scanID"))
+	if _, err := uuid.Parse(scanID); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid scan_id"})
+	}
+
+	ctx := c.UserContext()
+
+	var projectID string
+	err := h.DB.QueryRow(ctx, "SELECT project_id FROM scans WHERE id = $1", scanID).Scan(&projectID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "scan not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "database error"})
+	}
+
+	ok, err := db.ProjectOwnedByUser(ctx, h.DB, projectID, userID)
+	if err != nil || !ok {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "access denied"})
+	}
+
+	query := `
+		SELECT 
+			c.name as component_name, 
+			c.version as component_version, 
+			cv.cve_id, 
+			cv.severity, 
+			cv.summary, 
+			cv.fixed_version 
+		FROM component_vulnerabilities cv
+		JOIN components c ON c.id = cv.component_id
+		WHERE c.scan_id = $1
+		ORDER BY 
+			CASE cv.severity
+				WHEN 'CRITICAL' THEN 1
+				WHEN 'HIGH' THEN 2
+				WHEN 'MEDIUM' THEN 3
+				WHEN 'LOW' THEN 4
+				ELSE 5
+			END
+	`
+	rows, err := h.DB.Query(ctx, query, scanID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "database query error"})
+	}
+	defer rows.Close()
+
+	type vulnResp struct {
+		ComponentName    string `json:"component_name"`
+		ComponentVersion string `json:"component_version"`
+		CVEID            string `json:"cve_id"`
+		Severity         string `json:"severity"`
+		Summary          string `json:"summary"`
+		FixedVersion     string `json:"fixed_version"`
+	}
+
+	var vulns []vulnResp
+	summary := map[string]int{"critical": 0, "high": 0, "medium": 0, "low": 0}
+
+	for rows.Next() {
+		var v vulnResp
+		var fixed *string
+		if err := rows.Scan(&v.ComponentName, &v.ComponentVersion, &v.CVEID, &v.Severity, &v.Summary, &fixed); err != nil {
+			continue
+		}
+		if fixed != nil {
+			v.FixedVersion = *fixed
+		}
+		vulns = append(vulns, v)
+
+		switch strings.ToUpper(v.Severity) {
+		case "CRITICAL":
+			summary["critical"]++
+		case "HIGH":
+			summary["high"]++
+		case "MEDIUM":
+			summary["medium"]++
+		case "LOW":
+			summary["low"]++
+		}
+	}
+
+	if vulns == nil {
+		vulns = make([]vulnResp, 0)
+	}
+
+	return c.JSON(fiber.Map{
+		"summary":         summary,
+		"vulnerabilities": vulns,
+	})
+}
+
+// GetAllVulnerabilities handles GET /api/vulnerabilities
+func (h *Scans) GetAllVulnerabilities(c *fiber.Ctx) error {
+	userID := SupabaseUserID(c)
+	if userID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthenticated"})
+	}
+
+	ctx := c.UserContext()
+	query := `
+		SELECT 
+			c.name as component_name, 
+			c.version as component_version, 
+			cv.cve_id, 
+			cv.severity, 
+			cv.summary, 
+			cv.fixed_version,
+			c.scan_id,
+			p.name as project_name
+		FROM component_vulnerabilities cv
+		JOIN components c ON c.id = cv.component_id
+		JOIN scans s ON s.id = c.scan_id
+		JOIN projects p ON p.id = s.project_id
+		WHERE p.user_id = $1
+		ORDER BY cv.created_at DESC
+		LIMIT 500
+	`
+	rows, err := h.DB.Query(ctx, query, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "database query error"})
+	}
+	defer rows.Close()
+
+	type vulnResp struct {
+		ComponentName    string `json:"component_name"`
+		ComponentVersion string `json:"component_version"`
+		CVEID            string `json:"cve_id"`
+		Severity         string `json:"severity"`
+		Summary          string `json:"summary"`
+		FixedVersion     string `json:"fixed_version"`
+		ScanID           string `json:"scan_id"`
+		ProjectName      string `json:"project_name"`
+	}
+
+	var vulns []vulnResp
+	summary := map[string]int{"critical": 0, "high": 0, "medium": 0, "low": 0}
+
+	for rows.Next() {
+		var v vulnResp
+		var fixed *string
+		if err := rows.Scan(&v.ComponentName, &v.ComponentVersion, &v.CVEID, &v.Severity, &v.Summary, &fixed, &v.ScanID, &v.ProjectName); err != nil {
+			continue
+		}
+		if fixed != nil {
+			v.FixedVersion = *fixed
+		}
+		vulns = append(vulns, v)
+
+		switch strings.ToUpper(v.Severity) {
+		case "CRITICAL":
+			summary["critical"]++
+		case "HIGH":
+			summary["high"]++
+		case "MEDIUM":
+			summary["medium"]++
+		case "LOW":
+			summary["low"]++
+		}
+	}
+
+	if vulns == nil {
+		vulns = make([]vulnResp, 0)
+	}
+
+	return c.JSON(fiber.Map{
+		"summary":         summary,
+		"vulnerabilities": vulns,
+	})
 }

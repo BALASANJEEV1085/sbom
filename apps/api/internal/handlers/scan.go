@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
+	"github.com/sbom-io/api/internal/compliance"
 	"github.com/sbom-io/api/internal/db"
 	gh "github.com/sbom-io/api/internal/github"
 	"github.com/sbom-io/api/internal/scanner"
@@ -263,6 +264,14 @@ func runScanJob(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, scan
 			fail()
 			return
 		}
+	} else if fileBytes, fetchErr := gh.FetchFile(scanCtx, githubToken, owner, repo, "pom.xml"); fetchErr == nil {
+		ecosystem = "maven"
+		pkgs, err = scanner.ScanMaven(scanCtx, rdb, fileBytes)
+		if err != nil {
+			log.Printf("scan %s: scan maven (pom.xml): %v", scanID, err)
+			fail()
+			return
+		}
 	} else {
 		log.Printf("scan %s: no supported manifest found in repo", scanID)
 		fail()
@@ -280,6 +289,19 @@ func runScanJob(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client, scan
 		if err := vuln.SaveComponentVulns(scanCtx, pool, vulnerabilities); err != nil {
 			log.Printf("scan %s: save vulns error: %v", scanID, err)
 		}
+	}
+
+	sbomMeta := compliance.SBOMMeta{
+		AuthorName:  "SBOM.io",
+		AuthorTool:  "sbom-io-scanner v1.0.0",
+		GeneratedAt: time.Now(),
+		RepoName:    repo,
+	}
+	ntiaResult := compliance.CheckNTIA(pkgs, sbomMeta)
+	euCompliant := compliance.CheckEUCRA(ntiaResult)
+
+	if err := db.UpdateScanCompliance(scanCtx, pool, scanID, ntiaResult.Score, ntiaResult.Compliant, euCompliant, ntiaResult); err != nil {
+		log.Printf("scan %s: update compliance error: %v", scanID, err)
 	}
 
 	if err := db.UpdateScanStatus(scanCtx, pool, scanID, "done"); err != nil {

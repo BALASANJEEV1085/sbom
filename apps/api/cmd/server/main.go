@@ -160,17 +160,30 @@ func main() {
 		}
 
 		scanHandlers := handlers.NewScans(pool, rdb)
+
+		// Public route — no JWT required (auditors click this link)
+		app.Get("/api/share/:token", scanHandlers.ViewShareLink)
+
 		api := app.Group("/api", handlers.SupabaseJWTAuth(jwtSecret))
 		api.Get("/dashboard/metrics", scanHandlers.GetDashboardMetrics)
+		api.Get("/dashboard/stats", scanHandlers.GetDashboardStats)
 		api.Post("/projects", scanHandlers.CreateProject)
 		api.Get("/projects", scanHandlers.ListProjects)
 		api.Get("/projects/:projectID/scans", scanHandlers.ListProjectScans)
 		api.Post("/scans", scanHandlers.CreateScan)
 		api.Get("/scans", scanHandlers.ListAllScans)
 		api.Get("/scans/:scanID", scanHandlers.GetScan)
+		api.Get("/scans/:scanID/compliance", scanHandlers.GetCompliance)
+		api.Get("/scans/:scanID/report/pdf", scanHandlers.DownloadPDFReport)
 		api.Get("/scans/:scanID/vulnerabilities", scanHandlers.GetScanVulnerabilities)
 		api.Get("/vulnerabilities", scanHandlers.GetAllVulnerabilities)
+		api.Post("/scans/:scanID/sbom", scanHandlers.GenerateSBOM)
+		api.Get("/sboms/:sbomID/download", scanHandlers.DownloadSBOM)
+		api.Post("/sboms/:sbomID/share", scanHandlers.CreateShareLink)
+		api.Get("/sboms/:sbomID/shares", scanHandlers.ListShareLinks)
 		log.Print("/api routes enabled (DATABASE_URL + SUPABASE_JWT_SECRET)")
+
+
 	} else {
 		log.Print("warning: /api routes disabled — set DATABASE_URL and SUPABASE_JWT_SECRET (e.g. in apps/api/.env) to enable scans")
 	}

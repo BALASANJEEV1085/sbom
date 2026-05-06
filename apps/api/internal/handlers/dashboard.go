@@ -24,12 +24,14 @@ func (h *Scans) GetDashboardMetrics(c *fiber.Ctx) error {
 	recent := make([]fiber.Map, 0, len(m.RecentScans))
 	for _, r := range m.RecentScans {
 		recent = append(recent, fiber.Map{
-			"id":          r.ID,
-			"project_id":  r.ProjectID,
-			"status":      r.Status,
-			"created_at":  r.CreatedAt,
-			"project_name": r.ProjectName,
-			"github_url":  r.GithubURL,
+			"id":               r.ID,
+			"project_id":       r.ProjectID,
+			"status":           r.Status,
+			"created_at":       r.CreatedAt,
+			"project_name":     r.ProjectName,
+			"github_url":       r.GithubURL,
+			"compliance_score": r.ComplianceScore,
+			"ntia_compliant":   r.NTIACompliant,
 		})
 	}
 
@@ -40,5 +42,47 @@ func (h *Scans) GetDashboardMetrics(c *fiber.Ctx) error {
 		"clean_projects":  m.CleanProjects,
 		"recent_scans":    recent,
 		"generated_at":    time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
+// GetDashboardStats handles GET /api/dashboard/stats.
+func (h *Scans) GetDashboardStats(c *fiber.Ctx) error {
+	userID := SupabaseUserID(c)
+	if userID == "" {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{"error": "unauthenticated"})
+	}
+
+	ctx := c.UserContext()
+	s, err := db.GetDashboardStats(ctx, h.DB, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "database error"})
+	}
+
+	recent := make([]fiber.Map, 0, len(s.RecentScans))
+	for _, r := range s.RecentScans {
+		recent = append(recent, fiber.Map{
+			"id":              r.ID,
+			"repo_name":       r.ProjectName,
+			"ecosystem":       r.Ecosystem,
+			"status":          r.Status,
+			"component_count": r.ComponentCount,
+			"critical_cves":   r.CriticalCVEs,
+			"ntia_score":      r.NTIAScore,
+			"created_at":      r.CreatedAt,
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"total_projects":       s.TotalProjects,
+		"total_scans":          s.TotalScans,
+		"total_components":     s.TotalComponents,
+		"critical_cves":        s.CriticalCVEs,
+		"high_cves":            s.HighCVEs,
+		"medium_cves":          s.MediumCVEs,
+		"low_cves":             s.LowCVEs,
+		"ntia_compliant_scans": s.NTIACompliantScans,
+		"non_compliant_scans":  s.NonCompliantScans,
+		"clean_projects":       s.CleanProjects,
+		"recent_scans":         recent,
 	})
 }

@@ -6,6 +6,7 @@ package db
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -223,4 +224,28 @@ func ListScansForProject(ctx context.Context, db Querier, projectID string) ([]S
 		return nil, fmt.Errorf("list scans iterate: %w", err)
 	}
 	return out, nil
+}
+
+// UpdateScanCompliance updates the compliance fields of a scan.
+func UpdateScanCompliance(ctx context.Context, db Querier, scanID string, score int, ntiaCompliant bool, euCompliant bool, detail any) error {
+	detailJSON, err := json.Marshal(detail)
+	if err != nil {
+		return fmt.Errorf("marshal compliance detail: %w", err)
+	}
+
+	tag, err := db.Exec(ctx, `
+		UPDATE scans 
+		SET compliance_score = $2, 
+		    ntia_compliant = $3, 
+		    eu_cra_compliant = $4, 
+		    compliance_detail = $5 
+		WHERE id = $1::uuid
+	`, scanID, score, ntiaCompliant, euCompliant, string(detailJSON))
+	if err != nil {
+		return fmt.Errorf("update scan compliance: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("update scan compliance: no scan with id %s", scanID)
+	}
+	return nil
 }

@@ -80,8 +80,10 @@ func GetProjectForUser(ctx context.Context, db Querier, projectID, userID string
 // UserScanRow is a scan joined with its parent project for dashboard lists.
 type UserScanRow struct {
 	Scan
-	ProjectName string
-	GithubURL   string
+	ProjectName     string
+	GithubURL       string
+	ComplianceScore *int
+	NTIACompliant   *bool
 }
 
 // ListUserScans returns scans across all projects owned by the user.
@@ -94,7 +96,8 @@ func ListUserScans(ctx context.Context, db Querier, userID string, limit int) ([
 	}
 	rows, err := db.Query(ctx, `
 		SELECT s.id::text, s.project_id::text, s.status, s.created_at,
-		       COALESCE(p.name, ''), COALESCE(p.github_url, '')
+		       COALESCE(p.name, ''), COALESCE(p.github_url, ''),
+		       s.compliance_score, s.ntia_compliant
 		FROM scans s
 		INNER JOIN projects p ON p.id = s.project_id
 		WHERE p.user_id = $1::uuid
@@ -112,6 +115,7 @@ func ListUserScans(ctx context.Context, db Querier, userID string, limit int) ([
 		if err := rows.Scan(
 			&row.ID, &row.ProjectID, &row.Status, &row.CreatedAt,
 			&row.ProjectName, &row.GithubURL,
+			&row.ComplianceScore, &row.NTIACompliant,
 		); err != nil {
 			return nil, fmt.Errorf("list user scans row: %w", err)
 		}

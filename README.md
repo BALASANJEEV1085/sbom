@@ -1,6 +1,6 @@
 # sbom
 
-[![Deptic Security](http://localhost:8081/badge/github/BALASANJEEV1085/sbom)](http://localhost:3000/dashboard)
+[![Deptic Security](https://igloo-county-dismay.ngrok-free.dev/badge/github/BALASANJEEV1085/sbom)](http://localhost:3000/dashboard)
 
 ## About
 
